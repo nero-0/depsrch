@@ -1,0 +1,157 @@
+name: arch-deps-tree
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - pkglist.txt
+      - .github/workflows/arch-deps-tree.yml
+
+jobs:
+  deps:
+    runs-on: ubuntu-latest
+
+    # Job inteiro roda dentro de um Arch Linux container
+    container:
+      image: archlinux:base-devel
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Init keyring + tools
+        run: |
+          pacman-key --init
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm
+
+          # pactree
+          pacman -S --noconfirm pacman-contrib
+
+          # script abaixo usa python
+          pacman -S --noconfirm python
+
+      - name: Generate dedup tree (repeat only explicit pkgs)
+        run: |
+          cat > arch_tree.py <<'PY'
+          import re, sys, subprocess
+          from collections import defaultdict
+
+          PKGLIST = sys.argv[1]
+
+          def read_pkglist(path):
+              pkgs = []
+              for line in open(path, "r", encoding="utf-8"):
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  pkgs.append(line)
+              return pkgs
+
+          roots = read_pkglist(PKGLIST)
+          explicit = set(roots)
+
+          # Build dependency edges using pactree's graph output
+          # pactree -g: Graphviz; pactree -s: sync db
+          edge_re = re.compile(r'"([^"]+)"\s*->\s*"([^"]+)"')
+          deps = defaultdict(set)
+
+          for r in roots:
+              p = subprocess.run(["pactree", "-s", "-g", r], text=True, capture_output=True)
+              if p.returncode != 0:
+                  print(f"# ERROR pactree failed for {r}: {p.stderr.strip()}", file=sys.stderr)
+                  continue
+              for a, b in edge_re.findall(p.stdout):
+                  deps[a].add(b)
+
+          # Precompute reachability among explicit packages (for "limpa" hint)
+          # DFS per root (on the deps graph we collected)
+          def reachable(start):
+              seen = set()
+              stack = [start]
+              while stack:
+                  cur = stack.pop()
+                  for ch in deps.get(cur, ()):
+                      if ch not in seen:
+                          seen.add(ch)
+                          stack.append(ch)
+              return seen
+
+          reach = {r: reachable(r) for r in roots}
+
+          redundant = []
+          for p in roots:
+              # p is redundant if any other root reaches p
+              if any(p in reach[r] for r in roots if r != p):
+                  redundant.append(p)
+
+          # Tree printing with global "expanded" set:
+          # - expand each non-explicit package only once globally
+          # - show explicit packages wherever they appear (tagged), but don't re-expand them as deps
+          expanded = set()
+
+          def node_label(name, is_root=False):
+              if name in explicit:
+                  return f"{name} [explicit]" + (" [root]" if is_root else "")
+              return name
+
+          def print_subtree(pkg, prefix, is_last, stack):
+              branch = "└── " if is_last else "├── "
+              cont_prefix = "    " if is_last else "│   "
+
+              # avoid cycles (should be rare, but be safe)
+              if pkg in stack:
+                  print(prefix + branch + f"{node_label(pkg)} [cycle]")
+                  return
+
+              # If pkg is explicit AND it's not the root we are currently printing,
+              # print it (so you notice it was in your list), but don't expand here.
+              if pkg in explicit:
+                  print(prefix + branch + node_label(pkg))
+                  return
+
+              # Non-explicit: expand only once globally; later occurrences become a reference line
+              if pkg in expanded:
+                  print(prefix + branch + f"{node_label(pkg)} [ref]")
+                  return
+
+              print(prefix + branch + node_label(pkg))
+              expanded.add(pkg)
+
+              children = sorted(deps.get(pkg, ()))
+              if not children:
+                  return
+
+              new_stack = set(stack)
+              new_stack.add(pkg)
+
+              for i, ch in enumerate(children):
+                  last = (i == len(children) - 1)
+                  print_subtree(ch, prefix + cont_prefix, last, new_stack)
+
+          # Print forest
+          for i, r in enumerate(roots):
+              print(node_label(r, is_root=True))
+              # Note: don't dedupe roots: always show each requested root
+              children = sorted(deps.get(r, ()))
+              for j, ch in enumerate(children):
+                  print_subtree(ch, "", j == len(children) - 1, set([r]))
+              print()
+
+          if redundant:
+              print("# Pacotes da sua lista que aparecem como dependência de outros da lista (candidatos a remover):")
+              for p in redundant:
+                  print(f"#   - {p}")
+          PY
+
+          python arch_tree.py pkglist.txt > deps.tree.txt
+          cat deps.tree.txt
+
+      - name: Upload report
+        uses: actions/upload-artifact@v6
+        with:
+          name: arch-deps-tree
+          path: deps.tree.txt
