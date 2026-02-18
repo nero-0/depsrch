@@ -26,9 +26,7 @@ jobs:
           pacman-key --init
           pacman -Sy --noconfirm archlinux-keyring
           pacman -Syu --noconfirm
-
           pacman -S --noconfirm pacman-contrib
-
           pacman -S --noconfirm python
 
       - name: Generate dedup tree + summary at end
@@ -38,6 +36,10 @@ jobs:
           from collections import defaultdict
 
           PKGLIST = sys.argv[1]
+          OUT = "deps.tree.txt"
+
+          # Em alguns ambientes/versões, o -g pode incluir nós sintéticos no graphviz
+          SYNTHETIC = {"START", "END"}
 
           def read_pkglist(path):
               pkgs = []
@@ -52,21 +54,23 @@ jobs:
           explicit = set(roots)
 
           # Build dependency edges using pactree's graph output
-          # pactree -g: Graphviz; pactree -s: sync db
           edge_re = re.compile(r'"([^"]+)"\s*->\s*"([^"]+)"')
-          deps = defaultdict(set)   # a -> {b,c}
-          rdeps = defaultdict(set)  # b -> {a,...}  (who pulls b directly)
+          deps = defaultdict(set)    # a -> {b,c}
+          rdeps = defaultdict(set)   # b -> {a,...} (quem puxa b diretamente)
 
           for r in roots:
               p = subprocess.run(["pactree", "-s", "-g", r], text=True, capture_output=True)
               if p.returncode != 0:
                   print(f"# ERROR pactree failed for {r}: {p.stderr.strip()}", file=sys.stderr)
                   continue
+
               for a, b in edge_re.findall(p.stdout):
+                  if a in SYNTHETIC or b in SYNTHETIC:
+                      continue
                   deps[a].add(b)
                   rdeps[b].add(a)
 
-          # Reachability per root (to know which roots ultimately pull a package)
+          # Reachability per root (para saber quais roots puxam um pacote, direta/indiretamente)
           def reachable(start):
               seen = set()
               stack = [start]
@@ -80,7 +84,7 @@ jobs:
 
           reach = {r: reachable(r) for r in roots}
 
-          # Find one example path root -> ... -> target (for nicer reporting)
+          # Encontra 1 caminho exemplo root -> ... -> target (para visualização)
           def find_any_path(start, target):
               stack = [(start, [start])]
               seen = set()
@@ -97,75 +101,6 @@ jobs:
                       stack.append((ch, path + [ch]))
               return None
 
-          # Tree printing:
-          # - expand each non-explicit package only once globally
-          # - show explicit packages wherever they appear (tagged), but don't re-expand them as deps
-          expanded = set()
-
-          def node_label(name, is_root=False):
-              tags = []
-              if name in explicit:
-                  tags.append("explicit")
-              if is_root:
-                  tags.append("root")
-              return name + ("" if not tags else " " + " ".join(f"[{t}]" for t in tags))
-
-          def print_subtree(pkg, prefix, is_last, stack):
-              branch = "└── " if is_last else "├── "
-              cont_prefix = "    " if is_last else "│   "
-
-              # avoid cycles
-              if pkg in stack:
-                  print(prefix + branch + f"{pkg} [cycle]")
-                  return
-
-              # If pkg is explicit AND it's not the root we are currently printing,
-              # print it (so you notice it was in your list), but don't expand here.
-              # Mark also as [ref] so it is easy to filter.
-              if pkg in explicit:
-                  print(prefix + branch + f"{pkg} [explicit] [ref]")
-                  return
-
-              # Non-explicit: expand only once globally; later occurrences become a reference line
-              if pkg in expanded:
-                  print(prefix + branch + f"{pkg} [ref]")
-                  return
-
-              print(prefix + branch + pkg)
-              expanded.add(pkg)
-
-              children = sorted(deps.get(pkg, ()))
-              if not children:
-                  return
-
-              new_stack = set(stack)
-              new_stack.add(pkg)
-
-              for i, ch in enumerate(children):
-                  last = (i == len(children) - 1)
-                  print_subtree(ch, prefix + cont_prefix, last, new_stack)
-
-          # Print forest
-          for r in roots:
-              print(node_label(r, is_root=True))
-              children = sorted(deps.get(r, ()))
-              for j, ch in enumerate(children):
-                  print_subtree(ch, "", j == len(children) - 1, set([r]))
-              print()
-
-          # ---- Summary section (same file, clearer & cohesive) ----
-          # Explicit packages that appear as dependency of *something* in the collected graph:
-          # i.e., have at least one direct parent (incoming edge)
-          pulled = []
-          not_pulled = []
-
-          for p in roots:
-              parents = sorted(x for x in rdeps.get(p, set()) if x != p)
-              if parents:
-                  pulled.append(p)
-              else:
-                  not_pulled.append(p)
-
           def fmt_path(path):
               if not path:
                   return None
@@ -173,31 +108,114 @@ jobs:
                   return " -> ".join(path[:3] + ["..."] + path[-2:])
               return " -> ".join(path)
 
-          if pulled:
-              print("# Pacotes da sua lista que aparecem como dependência (quem puxa):")
-              for p in sorted(pulled):
-                  parents = sorted(x for x in rdeps.get(p, set()) if x != p)
+          def sort_parents(parents):
+              # roots (da sua lista) primeiro, depois o resto; ambos em ordem alfabética
+              return sorted(parents, key=lambda x: (0 if x in explicit else 1, x))
+
+          # Escreve em UTF-8 com BOM para não “quebrar” em viewers que assumem ANSI
+          with open(OUT, "w", encoding="utf-8-sig", newline="\n") as out:
+              def o(s=""):
+                  print(s, file=out)
+
+              # ---------- Tree printing ----------
+              expanded = set()
+
+              def node_label(name, is_root=False):
+                  tags = []
+                  if name in explicit:
+                      tags.append("explicit")
+                  if is_root:
+                      tags.append("root")
+                  return name + ("" if not tags else " " + " ".join(f"[{t}]" for t in tags))
+
+              def print_subtree(pkg, prefix, is_last, stack):
+                  branch = "└── " if is_last else "├── "
+                  cont_prefix = "    " if is_last else "│   "
+
+                  if pkg in stack:
+                      o(prefix + branch + f"{pkg} [cycle]")
+                      return
+
+                  # explicit como dependência: mostra e marca [explicit] [ref], não expande aqui
+                  if pkg in explicit:
+                      o(prefix + branch + f"{pkg} [explicit] [ref]")
+                      return
+
+                  # dedupe global: não-explicit só expande 1x
+                  if pkg in expanded:
+                      o(prefix + branch + f"{pkg} [ref]")
+                      return
+
+                  o(prefix + branch + pkg)
+                  expanded.add(pkg)
+
+                  children = sorted(deps.get(pkg, ()))
+                  if not children:
+                      return
+
+                  new_stack = set(stack)
+                  new_stack.add(pkg)
+
+                  for i, ch in enumerate(children):
+                      last = (i == len(children) - 1)
+                      print_subtree(ch, prefix + cont_prefix, last, new_stack)
+
+              # Forest
+              for r in roots:
+                  o(node_label(r, is_root=True))
+                  children = sorted(deps.get(r, ()))
+                  for j, ch in enumerate(children):
+                      print_subtree(ch, "", j == len(children) - 1, set([r]))
+                  o()
+
+              # ---------- Summary ----------
+              o("# ===== Resumo (pkglist) =====")
+              o("# A) Pacotes da sua lista que aparecem como dependência de OUTROS pacotes da lista (candidatos a remover):")
+
+              redundant = []
+              for p in roots:
                   roots_that_pull = sorted(r for r in roots if r != p and p in reach.get(r, set()))
-
-                  print(f"# - {p}")
-                  if parents:
-                      print(f"#   puxado diretamente por: {', '.join(parents)}")
                   if roots_that_pull:
-                      print(f"#   (via roots da lista): {', '.join(roots_that_pull)}")
-                      # mostra um exemplo de caminho (só 1) pra ficar legível
-                      ex_root = roots_that_pull[0]
-                      path = find_any_path(ex_root, p)
-                      if path:
-                          print(f"#   exemplo: {fmt_path(path)}")
-                  print("#")
+                      redundant.append((p, roots_that_pull))
 
-          if not_pulled:
-              print("# Pacotes da sua lista que NÃO aparecem como dependência de nada (no grafo gerado):")
-              for p in sorted(not_pulled):
-                  print(f"# - {p}")
+              if redundant:
+                  for p, roots_that_pull in sorted(redundant, key=lambda x: x[0]):
+                      parents_raw = [x for x in rdeps.get(p, set()) if x not in SYNTHETIC and x != p]
+                      parents = sort_parents(parents_raw)
+
+                      o(f"# - {p}")
+                      o(f"#   puxado por (roots da lista): {', '.join(roots_that_pull)}")
+
+                      # “mesmo que seja dependência”: aqui entram TODOS os pais diretos (roots ou deps intermediárias)
+                      if parents:
+                          o(f"#   puxado diretamente por: {', '.join(parents)}")
+
+                      # 1 caminho exemplo PARA CADA root que puxa
+                      for r in roots_that_pull:
+                          path = find_any_path(r, p)
+                          if path:
+                              o(f"#   exemplo ({r}): {fmt_path(path)}")
+
+                      o("#")
+              else:
+                  o("#   (nenhum)")
+              o()
+
+              o("# B) Pacotes da sua lista que NÃO aparecem como dependência de nada (no grafo gerado):")
+              not_pulled = []
+              for p in roots:
+                  parents_raw = [x for x in rdeps.get(p, set()) if x not in SYNTHETIC and x != p]
+                  if not parents_raw:
+                      not_pulled.append(p)
+
+              if not_pulled:
+                  for p in sorted(not_pulled):
+                      o(f"# - {p}")
+              else:
+                  o("#   (nenhum)")
           PY
 
-          python arch_tree.py pkglist.txt > deps.tree.txt
+          python arch_tree.py pkglist.txt
           cat deps.tree.txt
 
       - name: Upload report
