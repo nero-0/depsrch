@@ -23,53 +23,39 @@ jobs:
 
       - name: Init keyring + tools
         run: |
-          set -euo pipefail
-
           pacman-key --init
-          pacman-key --populate archlinux
-
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Syu --noconfirm --needed
+          pacman -Syu --noconfirm
 
-          # pactree
-          pacman -S --noconfirm --needed pacman-contrib
+          pacman -S --noconfirm pacman-contrib
 
-          pacman -S --noconfirm --needed python
+          pacman -S --noconfirm python
 
-      - name: Generate tree + redundant report + minimal pkglist
+      - name: Generate dedup tree + summary at end
         run: |
-          set -euo pipefail
-
           cat > arch_tree.py <<'PY'
           import re, sys, subprocess
           from collections import defaultdict
 
-          PKGLIST_PATH = sys.argv[1]
-
-          OUT_TREE = "deps.tree.txt"
-          OUT_REDUNDANT = "redundant.tsv"
-          OUT_MIN = "pkglist.min.txt"
+          PKGLIST = sys.argv[1]
 
           def read_pkglist(path):
               pkgs = []
               for line in open(path, "r", encoding="utf-8"):
-                  s = line.strip()
-                  if not s or s.startswith("#"):
+                  line = line.strip()
+                  if not line or line.startswith("#"):
                       continue
-                  pkgs.append(s)
+                  pkgs.append(line)
               return pkgs
 
-          def load_pkglist_lines(path):
-              # Preserva comentários/linhas vazias para possibilitar gerar um "min" mais legível
-              return open(path, "r", encoding="utf-8").read().splitlines()
-
-          roots = read_pkglist(PKGLIST_PATH)
+          roots = read_pkglist(PKGLIST)
           explicit = set(roots)
 
           # Build dependency edges using pactree's graph output
+          # pactree -g: Graphviz; pactree -s: sync db
           edge_re = re.compile(r'"([^"]+)"\s*->\s*"([^"]+)"')
           deps = defaultdict(set)   # a -> {b,c}
-          rdeps = defaultdict(set)  # b -> {a,...}
+          rdeps = defaultdict(set)  # b -> {a,...}  (who pulls b directly)
 
           for r in roots:
               p = subprocess.run(["pactree", "-s", "-g", r], text=True, capture_output=True)
@@ -80,6 +66,7 @@ jobs:
                   deps[a].add(b)
                   rdeps[b].add(a)
 
+          # Reachability per root (to know which roots ultimately pull a package)
           def reachable(start):
               seen = set()
               stack = [start]
@@ -93,16 +80,7 @@ jobs:
 
           reach = {r: reachable(r) for r in roots}
 
-          # pkg is "redundant" if some other root reaches it (directly or indirectly)
-          redundant_roots = {}
-          for p in roots:
-              pulled_by_roots = sorted(r for r in roots if r != p and p in reach.get(r, set()))
-              if pulled_by_roots:
-                  redundant_roots[p] = pulled_by_roots
-
-          redundant_set = set(redundant_roots.keys())
-
-          # Find one example path root -> ... -> target (for reporting)
+          # Find one example path root -> ... -> target (for nicer reporting)
           def find_any_path(start, target):
               stack = [(start, [start])]
               seen = set()
@@ -119,121 +97,111 @@ jobs:
                       stack.append((ch, path + [ch]))
               return None
 
-          # ---------- Write tree ----------
+          # Tree printing:
+          # - expand each non-explicit package only once globally
+          # - show explicit packages wherever they appear (tagged), but don't re-expand them as deps
           expanded = set()
 
-          def fmt(name, tags=()):
-              if tags:
-                  return f"{name} " + " ".join(f"[{t}]" for t in tags)
-              return name
+          def node_label(name, is_root=False):
+              tags = []
+              if name in explicit:
+                  tags.append("explicit")
+              if is_root:
+                  tags.append("root")
+              return name + ("" if not tags else " " + " ".join(f"[{t}]" for t in tags))
 
-          def write_tree():
-              with open(OUT_TREE, "w", encoding="utf-8") as f:
-                  def w(line=""):
-                      f.write(line + "\n")
+          def print_subtree(pkg, prefix, is_last, stack):
+              branch = "└── " if is_last else "├── "
+              cont_prefix = "    " if is_last else "│   "
 
-                  def print_subtree(pkg, prefix, is_last, stack):
-                      branch = "└── " if is_last else "├── "
-                      cont_prefix = "    " if is_last else "│   "
+              # avoid cycles
+              if pkg in stack:
+                  print(prefix + branch + f"{pkg} [cycle]")
+                  return
 
-                      if pkg in stack:
-                          w(prefix + branch + fmt(pkg, ("cycle",)))
-                          return
+              # If pkg is explicit AND it's not the root we are currently printing,
+              # print it (so you notice it was in your list), but don't expand here.
+              # Mark also as [ref] so it is easy to filter.
+              if pkg in explicit:
+                  print(prefix + branch + f"{pkg} [explicit] [ref]")
+                  return
 
-                      # Explicit package appearing as dependency: show it and mark [explicit] [ref]
-                      # (ref = não expandimos aqui)
-                      if pkg in explicit:
-                          w(prefix + branch + fmt(pkg, ("explicit", "ref")))
-                          return
+              # Non-explicit: expand only once globally; later occurrences become a reference line
+              if pkg in expanded:
+                  print(prefix + branch + f"{pkg} [ref]")
+                  return
 
-                      # Non-explicit: expand only once globally; later occurrences are [ref]
-                      if pkg in expanded:
-                          w(prefix + branch + fmt(pkg, ("ref",)))
-                          return
+              print(prefix + branch + pkg)
+              expanded.add(pkg)
 
-                      w(prefix + branch + pkg)
-                      expanded.add(pkg)
+              children = sorted(deps.get(pkg, ()))
+              if not children:
+                  return
 
-                      children = sorted(deps.get(pkg, ()))
-                      if not children:
-                          return
+              new_stack = set(stack)
+              new_stack.add(pkg)
 
-                      new_stack = set(stack)
-                      new_stack.add(pkg)
+              for i, ch in enumerate(children):
+                  last = (i == len(children) - 1)
+                  print_subtree(ch, prefix + cont_prefix, last, new_stack)
 
-                      for i, ch in enumerate(children):
-                          last = (i == len(children) - 1)
-                          print_subtree(ch, prefix + cont_prefix, last, new_stack)
+          # Print forest
+          for r in roots:
+              print(node_label(r, is_root=True))
+              children = sorted(deps.get(r, ()))
+              for j, ch in enumerate(children):
+                  print_subtree(ch, "", j == len(children) - 1, set([r]))
+              print()
 
-                  for r in roots:
-                      w(fmt(r, ("explicit", "root")))
-                      children = sorted(deps.get(r, ()))
-                      for j, ch in enumerate(children):
-                          print_subtree(ch, "", j == len(children) - 1, set([r]))
-                      w()
+          # ---- Summary section (same file, clearer & cohesive) ----
+          # Explicit packages that appear as dependency of *something* in the collected graph:
+          # i.e., have at least one direct parent (incoming edge)
+          pulled = []
+          not_pulled = []
 
-          write_tree()
+          for p in roots:
+              parents = sorted(x for x in rdeps.get(p, set()) if x != p)
+              if parents:
+                  pulled.append(p)
+              else:
+                  not_pulled.append(p)
 
-          # ---------- Write redundant TSV report ----------
-          with open(OUT_REDUNDANT, "w", encoding="utf-8") as f:
-              f.write("pkg\tpulled_by_roots\tdirect_parents\texample_paths\n")
-              for pkg in sorted(redundant_roots.keys()):
-                  roots_that_pull = redundant_roots[pkg]
-                  direct_parents = sorted(rdeps.get(pkg, ()))
+          def fmt_path(path):
+              if not path:
+                  return None
+              if len(path) > 10:
+                  return " -> ".join(path[:3] + ["..."] + path[-2:])
+              return " -> ".join(path)
 
-                  paths = []
-                  for r in roots_that_pull:
-                      path = find_any_path(r, pkg)
+          if pulled:
+              print("# Pacotes da sua lista que aparecem como dependência (quem puxa):")
+              for p in sorted(pulled):
+                  parents = sorted(x for x in rdeps.get(p, set()) if x != p)
+                  roots_that_pull = sorted(r for r in roots if r != p and p in reach.get(r, set()))
+
+                  print(f"# - {p}")
+                  if parents:
+                      print(f"#   puxado diretamente por: {', '.join(parents)}")
+                  if roots_that_pull:
+                      print(f"#   (via roots da lista): {', '.join(roots_that_pull)}")
+                      # mostra um exemplo de caminho (só 1) pra ficar legível
+                      ex_root = roots_that_pull[0]
+                      path = find_any_path(ex_root, p)
                       if path:
-                          # comprime path muito longo
-                          if len(path) > 10:
-                              path_str = " -> ".join(path[:3] + ["..."] + path[-2:])
-                          else:
-                              path_str = " -> ".join(path)
-                          paths.append(path_str)
+                          print(f"#   exemplo: {fmt_path(path)}")
+                  print("#")
 
-                  f.write(
-                      pkg + "\t" +
-                      ",".join(roots_that_pull) + "\t" +
-                      ",".join(direct_parents) + "\t" +
-                      " | ".join(paths) +
-                      "\n"
-                  )
-
-          # ---------- Write minimal pkglist (remove redundants) ----------
-          # Mantém comentários e linhas vazias; remove apenas linhas de pacote redundante.
-          in_lines = load_pkglist_lines(PKGLIST_PATH)
-          out_lines = []
-          for line in in_lines:
-              s = line.strip()
-              if not s or s.startswith("#"):
-                  out_lines.append(line)
-                  continue
-              if s in redundant_set:
-                  # removendo de fato (lista mínima)
-                  continue
-              out_lines.append(line)
-
-          with open(OUT_MIN, "w", encoding="utf-8") as f:
-              f.write("\n".join(out_lines).rstrip() + "\n")
-
-          print("== deps.tree.txt ==")
-          print(open(OUT_TREE, "r", encoding="utf-8").read())
-
-          print("== redundant.tsv ==")
-          print(open(OUT_REDUNDANT, "r", encoding="utf-8").read())
-
-          print("== pkglist.min.txt ==")
-          print(open(OUT_MIN, "r", encoding="utf-8").read())
+          if not_pulled:
+              print("# Pacotes da sua lista que NÃO aparecem como dependência de nada (no grafo gerado):")
+              for p in sorted(not_pulled):
+                  print(f"# - {p}")
           PY
 
-          python arch_tree.py pkglist.txt
+          python arch_tree.py pkglist.txt > deps.tree.txt
+          cat deps.tree.txt
 
-      - name: Upload report(s)
+      - name: Upload report
         uses: actions/upload-artifact@v6
         with:
           name: arch-deps-tree
-          path: |
-            deps.tree.txt
-            redundant.tsv
-            pkglist.min.txt
+          path: deps.tree.txt
