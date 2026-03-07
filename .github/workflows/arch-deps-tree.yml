@@ -27,7 +27,6 @@ jobs:
           pacman -Sy --noconfirm archlinux-keyring
           pacman -Syu --noconfirm
 
-          # Chaotic AUR
           pacman-key --recv-key 3056513887B78AEB --keyserver keyserver.ubuntu.com
           pacman-key --lsign-key 3056513887B78AEB
           pacman -U --noconfirm 'https://cdn-mirror.chaotic.cx/chaotic-aur/chaotic-keyring.pkg.tar.zst'
@@ -63,14 +62,28 @@ jobs:
                   pkgs.append(line)
               return pkgs
 
+          def normalize_pkg(name):
+              """
+              Normaliza um nó do pactree:
+              - Descarta provisões de biblioteca (.so)
+              - Remove restrições de versão (>=, <=, =, >, <)
+              Retorna None se o nó deve ser ignorado.
+              """
+              if ".so" in name:
+                  return None
+              # Remove tudo a partir do primeiro operador de versão
+              name = re.split(r"[><=]", name, maxsplit=1)[0]
+              name = name.strip()
+              return name if name else None
+
           roots = read_pkglist(PKGLIST)
           explicit = set(roots)
 
           # ---------- Build graph via pactree ----------
           edge_re = re.compile(r'"([^"]+)"\s*->\s*"([^"]+)"')
-          deps  = defaultdict(set)   # parent -> {child, ...}
-          rdeps = defaultdict(set)   # child  -> {parent, ...}
-          failed = []                # pacotes que o pactree não resolveu
+          deps  = defaultdict(set)
+          rdeps = defaultdict(set)
+          failed = []
 
           for r in roots:
               p = subprocess.run(
@@ -83,9 +96,18 @@ jobs:
                   failed.append((r, msg))
                   continue
 
-              for a, b in edge_re.findall(p.stdout):
-                  if a in SYNTHETIC or b in SYNTHETIC:
+              for raw_a, raw_b in edge_re.findall(p.stdout):
+                  if raw_a in SYNTHETIC or raw_b in SYNTHETIC:
                       continue
+
+                  a = normalize_pkg(raw_a)
+                  b = normalize_pkg(raw_b)
+
+                  if a is None or b is None:
+                      continue
+                  if a == b:
+                      continue
+
                   deps[a].add(b)
                   rdeps[b].add(a)
 
@@ -130,7 +152,7 @@ jobs:
               return sorted(parents, key=lambda x: (0 if x in explicit else 1, x))
 
           # ========================================================
-          #  1) deps.tree.txt  —  árvore visual + resumo
+          #  1) deps.tree.txt
           # ========================================================
           with open(OUT_TREE, "w", encoding="utf-8", newline="\n") as out:
               def o(s=""):
@@ -175,7 +197,6 @@ jobs:
                   for i, ch in enumerate(children):
                       print_subtree(ch, prefix + cont_prefix, i == len(children) - 1, new_stack)
 
-              # ---- Forest ----
               for r in roots:
                   o(node_label(r, is_root=True))
                   children = sorted(deps.get(r, ()))
@@ -183,7 +204,7 @@ jobs:
                       print_subtree(ch, "", j == len(children) - 1, {r})
                   o()
 
-              # ---- Summary A: redundantes ----
+              # ---- Summary A ----
               o("# ===== Resumo (pkglist) =====")
               o("# A) Pacotes da lista que já são dependência de OUTROS da lista (candidatos a remover):")
 
@@ -211,7 +232,7 @@ jobs:
                   o("#   (nenhum)")
               o()
 
-              # ---- Summary B: não puxados ----
+              # ---- Summary B ----
               o("# B) Pacotes da lista que NÃO são dependência de nenhum outro (no grafo gerado):")
               not_pulled = [p for p in roots
                             if not any(x for x in rdeps.get(p, set()) if x not in SYNTHETIC and x != p)]
@@ -222,9 +243,9 @@ jobs:
                   o("#   (nenhum)")
               o()
 
-              # ---- Summary C: falhas ----
+              # ---- Summary C ----
               if failed:
-                  o("# C) Pacotes que o pactree NÃO conseguiu resolver (AUR / inexistente / typo):")
+                  o("# C) Pacotes que o pactree NÃO conseguiu resolver (inexistente / typo):")
                   for pkg, msg in sorted(failed, key=lambda x: x[0]):
                       o(f"# - {pkg}  ({msg})")
                   o()
@@ -240,14 +261,13 @@ jobs:
                 f"{len(all_pkgs)} pacotes únicos no total")
 
           # ========================================================
-          #  2) all-deps.txt  —  lista plana de TODOS os pacotes
+          #  2) all-deps.txt
           # ========================================================
           all_pkgs = set(roots)
           for r in roots:
               all_pkgs.update(reach.get(r, set()))
 
           only_deps = sorted(all_pkgs - explicit)
-          explicit_sorted = sorted(explicit)
 
           with open(OUT_ALL, "w", encoding="utf-8", newline="\n") as f:
               f.write(f"# Gerado automaticamente a partir de {PKGLIST}\n")
